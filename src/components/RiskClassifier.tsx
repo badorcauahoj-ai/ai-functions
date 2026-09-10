@@ -1,4 +1,6 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import { saveClassification } from '../api'
+import { downloadTextFile } from '../download'
 
 type Area = 'hr' | 'finance' | 'health' | 'support' | 'other'
 type Decision = 'autonomous' | 'assists'
@@ -25,6 +27,10 @@ const AREA_OPTIONS: { value: Area; label: string }[] = [
   { value: 'other', label: 'Jiné — interní analytika, doporučování' },
 ]
 
+const AREA_LABELS: Record<Area, string> = Object.fromEntries(
+  AREA_OPTIONS.map((o) => [o.value, o.label]),
+) as Record<Area, string>
+
 const DECISION_OPTIONS: { value: Decision; label: string }[] = [
   {
     value: 'autonomous',
@@ -49,7 +55,6 @@ function classify(answers: Answers): RiskLevel {
     return 'high'
   }
   if (area && highRiskAreas.includes(area)) {
-    // supports a human decision, still sensitive domain
     return 'limited'
   }
   if (area === 'support') {
@@ -112,7 +117,13 @@ const LEVEL_META: Record<RiskLevel, { label: string; className: string }> = {
 
 const TOTAL_STEPS = 3
 
-export default function RiskClassifier() {
+type SaveState = 'idle' | 'saving' | 'ok' | 'error'
+
+interface Props {
+  onSaved?: () => void
+}
+
+export default function RiskClassifier({ onSaved }: Props) {
   const [step, setStep] = useState(0)
   const [answers, setAnswers] = useState<Answers>({
     area: null,
@@ -120,12 +131,41 @@ export default function RiskClassifier() {
     discloses: null,
   })
   const [finished, setFinished] = useState(false)
+  const [saveState, setSaveState] = useState<SaveState>('idle')
 
   const level = useMemo(() => classify(answers), [answers])
   const checklist = useMemo(
     () => buildChecklist(level, answers),
     [level, answers],
   )
+
+  // Try to persist the result to the backend as soon as we land on it.
+  // Fails silently into an error state if the backend isn't running —
+  // the classifier itself still works without it.
+  useEffect(() => {
+    if (!finished || !answers.area || !answers.decision || !answers.discloses) return
+    let cancelled = false
+    setSaveState('saving')
+    saveClassification({
+      area: answers.area,
+      decision: answers.decision,
+      discloses: answers.discloses,
+      level,
+    })
+      .then(() => {
+        if (!cancelled) {
+          setSaveState('ok')
+          onSaved?.()
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setSaveState('error')
+      })
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [finished])
 
   function selectArea(value: Area) {
     setAnswers((a) => ({ ...a, area: value }))
@@ -155,6 +195,7 @@ export default function RiskClassifier() {
   function back() {
     if (finished) {
       setFinished(false)
+      setSaveState('idle')
       return
     }
     setStep((s) => Math.max(0, s - 1))
@@ -164,6 +205,23 @@ export default function RiskClassifier() {
     setAnswers({ area: null, decision: null, discloses: null })
     setStep(0)
     setFinished(false)
+    setSaveState('idle')
+  }
+
+  function exportChecklist() {
+    const lines = [
+      'AktRadar — výsledek klasifikace',
+      '================================',
+      '',
+      `Oblast: ${answers.area ? AREA_LABELS[answers.area] : '-'}`,
+      `Kategorie rizika: ${LEVEL_META[level].label}`,
+      '',
+      'Povinnosti k řešení:',
+      ...checklist.map((item) => `- [${item.ref}] ${item.text}`),
+      '',
+      `Vygenerováno: ${new Date().toLocaleString('cs-CZ')}`,
+    ]
+    downloadTextFile('aktradar-checklist.txt', lines.join('\n'))
   }
 
   return (
@@ -230,9 +288,9 @@ export default function RiskClassifier() {
           <div className={`result-badge ${LEVEL_META[level].className}`}>
             {LEVEL_META[level].label}
           </div>
-          <p style={{ color: 'var(--text-soft)', marginBottom: 8 }}>
+          <p style={{ color: 'var(--ink-soft)', marginBottom: 8 }}>
             Na základě vašich odpovědí patří tento AI systém do kategorie{' '}
-            <strong style={{ color: 'var(--text)' }}>
+            <strong style={{ color: 'var(--ink)' }}>
               {LEVEL_META[level].label.toLowerCase()}
             </strong>
             . Tohle jsou body, na které se zaměřit jako první:
@@ -246,6 +304,19 @@ export default function RiskClassifier() {
                 </div>
               </div>
             ))}
+          </div>
+
+          <div className="result-actions">
+            <button className="btn btn-ghost" onClick={exportChecklist}>
+              Stáhnout checklist (.txt)
+            </button>
+          </div>
+
+          <div className={`save-status ${saveState === 'ok' ? 'ok' : saveState === 'error' ? 'err' : ''}`}>
+            {saveState === 'saving' && 'Ukládám do historie…'}
+            {saveState === 'ok' && '✓ Uloženo do historie'}
+            {saveState === 'error' &&
+              '✕ Backend neběží — spusť ho podle README, ať se výsledky ukládají do historie'}
           </div>
         </>
       )}
